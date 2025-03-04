@@ -1,7 +1,12 @@
 from fastapi import APIRouter, HTTPException, status
 from fastapi import APIRouter, HTTPException, Depends
-from database import connect_db
-from utils import generate_video_embedding
+from utils import model, processor
+import os
+import faiss
+import numpy as np
+import torch
+from loguru import logger
+
 
 search_router = APIRouter()
 
@@ -10,25 +15,28 @@ async def health():
     return {"status": "ok"} 
 
 
-@search_router.get("/search/")
-async def search_videos(query: str, db_pool=Depends(connect_db)):
-    try:
-        # Convert query to embedding
-        query_embedding = await generate_video_embedding(query)
+@search_router.get("/search_clip/")
+async def search_clip(query: str):
+    index_path = "faiss_index.idx"
+    timestamps_path = "timestamps.npy"
 
-        async with db_pool.acquire() as conn:
-            results = await conn.fetch(
-                """
-                SELECT id, title, video_url 
-                FROM videos 
-                ORDER BY embedding <=> $1 
-                LIMIT 5
-                """, 
-                query_embedding
-            )
+    if not (os.path.exists(index_path) and os.path.exists(timestamps_path)):
+        return {"error": "No indexed video found. Please process a video first."}
 
-        return {"results": results}
-    except Exception as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Search failed: {str(e)}")
+    faiss_index = faiss.read_index(index_path)
+    timestamps = np.load(timestamps_path)
+
+    logger.info("Searching for query in indexed video...")
+    inputs = processor(text=query, return_tensors="pt", padding=True)
+    with torch.no_grad():
+        text_features = model.get_text_features(**inputs).numpy()
+
+    _, indices = faiss_index.search(text_features, k=1)
+    best_chunk_start = timestamps[indices[0][0]]
+
+    return {
+        "start_time": max(0, best_chunk_start - 2),  # Adding ±2 sec buffer
+        "end_time": best_chunk_start + 3
+    }
 
         

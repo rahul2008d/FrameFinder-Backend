@@ -1,18 +1,15 @@
 import os
-import uuid
-from fastapi import APIRouter
+import faiss
+import numpy as np
+from fastapi import APIRouter 
+from fastapi.responses import JSONResponse
 from fastapi import HTTPException, status, UploadFile
 from supabase import create_client, Client
 from .schema import UploadRequest, VideoMetadata
-from utils import extract_frames, generate_vit_embedding, download_video
+from utils import create_presigned_post, download_video_from_s3, extract_frames, encode_chunks, build_index
+from loguru import logger
+
 router = APIRouter()
-
-# Load environment variables
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_API_KEY = os.getenv("SUPABASE_API_KEY")
-
-# Supabase client
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_API_KEY)
 
 @router.get("/health-check")
 async def health_check():
@@ -22,62 +19,63 @@ async def health_check():
 @router.post("/get-signed-url/")
 async def get_signed_url(request: UploadRequest):
     try:
-        bucket_name = "videos"
+        bucket_name = "framefinder-videos-bucket"
         file_path = request.file_name  # Use actual file name
-        # 🔹 Upload file to Supabase Storage
-        response = supabase.storage.from_(bucket_name).create_signed_upload_url(file_path)
 
-        if not response:
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to generate signed URL")
+        boto3_response = create_presigned_post(bucket_name, file_path)
 
-        return {"signedUrl": response['signed_url'], "path": response['path']}
+        region = "ap-south-1"  
+        boto3_response["url"] = f"https://framefinder-videos-bucket.s3.{region}.amazonaws.com"
+
+        logger.info(f"Signed URL: {boto3_response['url']}")
+
+        # return {"signedUrl": response['signed_url'], "path": response['path']}
+        return JSONResponse(content={"url": boto3_response["url"], "fields": boto3_response["fields"]})
 
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to upload file: {str(e)}")
 
 
-@router.post("/update-metadata/")
-async def update_video_metadata(video: VideoMetadata):
-    try:
-        # 🔹 Get the public URL for the file
-        public_url = supabase.storage.from_("videos").get_public_url(video.file_name)
-        video_id = str(uuid.uuid4())
-        # 🔹 Insert metadata into Supabase table
-        response = supabase.table("videos").insert({"id": video_id, "file_name": video.file_name, "url": public_url}).execute()
+@router.post("/process_video/")
+async def process_video(request: UploadRequest):
+    # global faiss_index, timestamps
 
-        # ✅ Check for Supabase errors
-        if isinstance(response, tuple):
-            data, error = response
-            if error:
-                print("❌ Supabase error:", error)
-                return {"status": "error", "message": error.message}        
+    bucket = "framefinder-videos-bucket"
+    key = request.file_name
+    video_path = os.path.join(os.getcwd(), request.file_name)  # Full path
 
-        # ✅ Step 1: Download Video from Supabase URL
-        file_path = download_video(public_url)
+    # Step 1: Check if video already exists
+    if os.path.exists(video_path):
+        logger.info("⚡ Video already exists, skipping download.")
+    else:
+        logger.info("Downloading video from S3...")
+        download_video_from_s3(bucket, key, video_path)
+        logger.info("✅ Video downloaded successfully.")
 
-        # ✅ Step 2: Extract 5-second segments & frames
-        segments = extract_frames(file_path)
+    # Step 2: Extract frames
+    logger.info("Extracting frames from video...")
+    frames_dict = extract_frames(video_path)
+    logger.info(f"✅ Extracted {len(frames_dict)} frames.")
 
-        for segment in segments:
-            video_id = str(uuid.uuid4())
-            start_time, end_time, frame = segment["start_time"], segment["end_time"], segment["frame"]
+    # Step 3: Encode frames into embeddings
+    logger.info("Encoding frames into embeddings...")
+    chunk_embeddings = encode_chunks(frames_dict)
+    logger.info(f"✅ Encoded {len(chunk_embeddings)} embeddings.")
 
-            # ✅ Step 3: Generate ViT embeddings
-            embedding = generate_vit_embedding(frame)
+    # Step 4: Build FAISS index
+    logger.info("Building FAISS index...")
+    faiss_index, timestamps = build_index(chunk_embeddings)
 
-            # ✅ Step 4: Store in Supabase
-            response = supabase.table("video_segments").insert({
-                "id": str(uuid.uuid4()),
-                "video_id": video_id,
-                "start_time": start_time,
-                "end_time": end_time,
-                "embedding": embedding
-            }).execute()
+    index_path = "faiss_index.idx"
+    timestamps_path = "timestamps.npy"
 
-        return {"message": "Video metadata updated successfully", "file_name": video.file_name, "url": public_url}
+    faiss.write_index(faiss_index, index_path)
+    np.save(timestamps_path, timestamps)
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Embedding failed: {str(e)}")
+    logger.info(f"✅ FAISS index built successfully with {len(timestamps)} timestamps.")
+
+    return {"message": "Video processed and indexed successfully", "total_chunks": len(timestamps)}
+
 
 
 
