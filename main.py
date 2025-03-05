@@ -6,6 +6,9 @@ from upload_video.routes import router
 
 app = FastAPI()
 
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"]= "TRUE"
+
 # Include API routes
 app.include_router(search_router, prefix="/search", tags=["Search"])
 app.include_router(router, prefix="/video", tags=["Video"])
