@@ -1,29 +1,26 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from handlers import setup_exception_handlers
-from search_api.routes import search_router
-from upload_video.routes import router
+from settings import settings
+from utils.logging import setup_logging
+from routers.video.video import router as video_router
+from routers.search.search import router as search_router
 
-app = FastAPI()
-
-import os
-os.environ["KMP_DUPLICATE_LIB_OK"]= "TRUE"
-
-# Include API routes
-app.include_router(search_router, prefix="/search", tags=["Search"])
-app.include_router(router, prefix="/video", tags=["Video"])
-
-# Setup exception handlers
-# setup_exception_handlers(app)
+logger = setup_logging()
+app = FastAPI(title="FrameFinder", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=settings.cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
     allow_credentials=True,
 )
 
-if __name__ == "__main__":    
-    import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+app.include_router(video_router)
+app.include_router(search_router)
+
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok"}
+
+# dev: uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000

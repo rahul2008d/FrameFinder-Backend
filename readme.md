@@ -1,4 +1,4 @@
-# 🎥 FrameFinder Backend - AI-Powered Video Search 🚀
+# 🎥 FrameFinder Backend - AI-Powered Video Search with AWS 🚀
 
 FrameFinder is an **AI-driven video intelligence platform** built with **FastAPI**, leveraging **multimodal deep learning models** to **search video content with natural language**.
 
