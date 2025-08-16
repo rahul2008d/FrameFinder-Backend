@@ -2,7 +2,6 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException, status, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from loguru import logger
 import os
 from settings import settings
 from utils.s3 import create_presigned_post, create_presigned_get, download_to_path
@@ -28,13 +27,14 @@ async def health_check():
 @router.post("/get-signed-url")
 async def get_signed_url(req: UploadRequest):
     try:
-        # lock to a specific key (prefix + filename)
-        key = req.file_name if req.file_name.startswith(settings.s3_key_prefix) else f"{settings.s3_key_prefix}{req.file_name}"
-        post = create_presigned_post(key=key, content_type=req.content_type)
-        return JSONResponse(content={"url": post["url"], "fields": post["fields"], "key": key})
+        bucket = settings.s3_bucket_videos
+        key = req.file_name
+        if not key.startswith(settings.s3_key_prefix):
+            key = f"{settings.s3_key_prefix}{key}"
+        presign = create_presigned_post(bucket, key, content_type=req.content_type or "video/mp4")
+        return {"url": presign["url"], "fields": presign["fields"], "key": key}
     except Exception as e:
-        logger.exception("signed-url error")
-        raise HTTPException(status_code=500, detail=f"Failed to generate signed URL: {e}")
+        raise HTTPException(500, f"Failed to presign: {e}")
 
 def _local_video_path(video_key: str) -> str:
     safe = video_key.replace("/", "_")

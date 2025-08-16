@@ -7,16 +7,15 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
     log_level: str = "info"
-    environment: str = "dev"  # dev|staging|prod
+    environment: str = "dev"  
 
     # AWS / S3
     aws_region: Optional[str] = None
     aws_access_key_id: Optional[str] = None
     aws_secret_access_key: Optional[str] = None
-    s3_bucket_videos: str = "framefinder-videos-bucket"
-    s3_bucket_indexes: str = "framefinder-indexes-bucket"  # could be same as videos
+    s3_bucket_videos: str = "framefinder-videos-rahul"
+    s3_bucket_indexes: str = "framefinder-indexes-rahul"  
     s3_key_prefix: str = "uploads/"
-    s3_index_prefix: str = "indexes/"
 
     # CLIP / Search
     clip_model_id: str = "openai/clip-vit-base-patch32"
