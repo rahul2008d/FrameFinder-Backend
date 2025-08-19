@@ -6,22 +6,47 @@ from settings import settings
 from loguru import logger
 
 def get_s3_client():
-    # If you want to force the region: set FRAMEFINDER_AWS_REGION=eu-west-1
     cfg = Config(
         region_name=settings.aws_region or os.getenv("AWS_DEFAULT_REGION") or "eu-west-1",
         signature_version="s3v4",
         retries={"max_attempts": 5, "mode": "standard"},
         s3={"addressing_style": "virtual"},
     )
-    # Don't pass keys explicitly; let boto3 use the default chain (AWS_PROFILE / env / IAM)
-    return boto3.client("s3", config=cfg)
+
+    # 1) If explicit keys are provided (best for local/dev via .env), use them.
+    if settings.aws_access_key_id and settings.aws_secret_access_key:
+        session = boto3.Session(
+            aws_access_key_id=settings.aws_access_key_id,
+            aws_secret_access_key=settings.aws_secret_access_key,
+            region_name=settings.aws_region,
+        )
+        method = "explicit-keys"
+
+    # 2) Else if a profile is configured, pin to that profile from ~/.aws/credentials.
+    elif getattr(settings, "aws_profile", None):
+        session = boto3.Session(profile_name=settings.aws_profile, region_name=settings.aws_region)
+        method = f"profile:{settings.aws_profile}"
+
+    # 3) Else fall back to the default chain (good for prod on AWS with instance/task role).
+    else:
+        session = boto3.Session(region_name=settings.aws_region)
+        method = "default-chain"
+
+    s3 = session.client("s3", config=cfg)
+
+    # Lightweight diagnostics so you immediately see if you’re on temp tokens.
+    creds = session.get_credentials()
+    has_token = bool(getattr(creds, "token", None)) if creds else False
+    used_method = getattr(creds, "method", method if creds else method)
+    logger.info(f"AWS auth method={used_method} has_session_token={has_token} region={settings.aws_region}")
+
+    return s3
 
 def create_presigned_post(bucket: str, key: str, *, content_type: str | None = None,
-                          max_mb: int = 2048, expires_s: int = 3600):
+                          max_mb: int = 2048, expires_s: int = 900):
     s3 = get_s3_client()
     conditions = [
-        {"bucket": bucket},
-        ["starts-with", "$key", key],  # lock to exactly this key (or a prefix if you wish)
+        {"key": key},  # lock to exactly this key (or use ["starts-with","$key", prefix] if you need a prefix)
         ["content-length-range", 1, max_mb * 1024 * 1024],
     ]
     fields = {}
@@ -34,20 +59,15 @@ def create_presigned_post(bucket: str, key: str, *, content_type: str | None = N
         Key=key,
         Fields=fields or None,
         Conditions=conditions,
-        ExpiresIn=expires_s,
+        ExpiresIn=expires_s,   # 15 minutes is typical
     )
 
-    # Force the **regional** endpoint to avoid redirects / signature mismatches
-    region = settings.aws_region or os.getenv("AWS_DEFAULT_REGION") or "eu-west-1"
-    resp["url"] = f"https://{bucket}.s3.{region}.amazonaws.com"
-
-    # Helpful one-line debug (no secrets)
-    creds = boto3.Session().get_credentials()
+    f = resp["fields"]
     logger.info(
-        f"presign: bucket={bucket} key={key} region={region} "
-        f"cred_method={getattr(creds,'method',None)} "
-        f"fields={list(resp['fields'].keys())}"
-    )
+    "presign url={} has_token={} alg={} date={} key={}",
+    resp["url"], "x-amz-security-token" in f, f.get("x-amz-algorithm"),
+    f.get("x-amz-date"), f.get("key"),
+)
     return resp
 
 def create_presigned_get(key: str, *, expires_s: int = 3600) -> str:

@@ -13,12 +13,14 @@ from loguru import logger
 from settings import settings
 from utils.s3 import get_s3_client
 
-MAGIC = b"FFI1"
+MAGIC = b"FFI1"  # header for (timestamps np.save) + raw faiss bytes
 
+
+# ---------- FAISS core ----------
 
 def build_faiss_index(embeddings: Dict[int, np.ndarray]) -> Tuple[faiss.Index, List[int]]:
     dim = settings.embedding_dim
-    index = faiss.IndexFlatIP(dim)  # IP == cosine on normalized vectors
+    index = faiss.IndexFlatIP(dim)  # IP == cosine similarity if vectors are L2-normalized
     timestamps = list(sorted(embeddings.keys()))
     vectors = np.stack([embeddings[t] for t in timestamps]).astype("float32")
     index.add(vectors)
@@ -37,19 +39,16 @@ def serialize_index(index: faiss.Index, timestamps: List[int]) -> bytes:
     np.save(ts_buf, np.asarray(timestamps, dtype=np.int32))
     ts_bytes = ts_buf.getvalue()
 
-    header = MAGIC + struct.pack(">I", len(ts_bytes))  # big-endian length
+    header = MAGIC + struct.pack(">I", len(ts_bytes))
     return header + ts_bytes + idx_bytes
 
 
 def _faiss_deserialize(idx_bytes: bytes) -> faiss.Index:
-    """
-    Compat: Some faiss wheels accept bytes; others require a numpy uint8 array.
-    Try bytes first, then fall back to np.frombuffer(..., uint8).
-    """
     try:
         return faiss.deserialize_index(idx_bytes)
     except Exception:
         return faiss.deserialize_index(np.frombuffer(idx_bytes, dtype=np.uint8))
+
 
 def deserialize_index(blob: bytes) -> Tuple[faiss.Index, List[int]]:
     try:
@@ -59,10 +58,8 @@ def deserialize_index(blob: bytes) -> Tuple[faiss.Index, List[int]]:
             ts_len = struct.unpack(">I", blob[4:8])[0]
             if 8 + ts_len > len(blob):
                 raise ValueError(f"Bad header: ts_len={ts_len} exceeds blob len {len(blob)}")
-
-            ts_bytes = blob[8:8+ts_len]
-            idx_bytes = blob[8+ts_len:]
-
+            ts_bytes = blob[8:8 + ts_len]
+            idx_bytes = blob[8 + ts_len:]
             timestamps = np.load(io.BytesIO(ts_bytes), allow_pickle=False).astype(int).tolist()
             index = _faiss_deserialize(idx_bytes)
             return index, timestamps
@@ -78,9 +75,11 @@ def deserialize_index(blob: bytes) -> Tuple[faiss.Index, List[int]]:
         raise RuntimeError(f"deserialize_index error: {e}") from e
 
 
+# ---------- S3 keys ----------
+
 def s3_key_for_index(video_key: str) -> str:
     """
-    uploads/<user>-<ts>/<ts>-<file>.ext  ->  uploads/<user>-<ts>/<ts>-<file>.faiss.bin
+    uploads/<user>-<ts>/<ts>-<file>.ext -> uploads/<user>-<ts>/<ts>-<file>.faiss.bin
     """
     p = PurePosixPath(video_key)
     if not p.name:
@@ -88,17 +87,50 @@ def s3_key_for_index(video_key: str) -> str:
     return str(p.with_name(f"{p.stem}.faiss.bin"))
 
 
+def s3_key_for_sidecar(video_key: str) -> str:
+    """
+    Sidecar with timestamps + max-pooled vectors (npz).
+    uploads/.../<stem>.sidecar.npz
+    """
+    p = PurePosixPath(video_key)
+    if not p.name:
+        raise ValueError("video_key must include a file name")
+    return str(p.with_name(f"{p.stem}.sidecar.npz"))
+
+
+# ---------- S3 upload/download ----------
+
 def upload_index_to_s3(video_key: str, blob: bytes) -> str:
     s3 = get_s3_client()
     key = s3_key_for_index(video_key)
     bucket = settings.s3_bucket_videos
-    s3.put_object(
-        Bucket=bucket,
-        Key=key,
-        Body=blob,
-        ContentType="application/octet-stream",
-    )
+    s3.put_object(Bucket=bucket, Key=key, Body=blob, ContentType="application/octet-stream")
     logger.info(f"✅ Uploaded index to s3://{bucket}/{key}")
+    return key
+
+
+def upload_sidecar_to_s3(video_key: str, timestamps: List[int], max_vectors: np.ndarray) -> str:
+    """
+    Store tiny sidecar with aligned timestamps + max-pooled chunk vectors.
+    - timestamps: list[int] of length N (order used by FAISS index)
+    - max_vectors: np.ndarray shape (N, D) float32 (already L2-normalized)
+    """
+    if not isinstance(max_vectors, np.ndarray):
+        max_vectors = np.asarray(max_vectors, dtype="float32")
+    if max_vectors.dtype != np.float32:
+        max_vectors = max_vectors.astype("float32")
+    if max_vectors.ndim != 2:
+        raise ValueError("max_vectors must be 2D (N, D)")
+
+    buf = io.BytesIO()
+    np.savez_compressed(buf, timestamps=np.asarray(timestamps, dtype=np.int32), maxp=max_vectors)
+    payload = buf.getvalue()
+
+    s3 = get_s3_client()
+    key = s3_key_for_sidecar(video_key)
+    bucket = settings.s3_bucket_videos
+    s3.put_object(Bucket=bucket, Key=key, Body=payload, ContentType="application/octet-stream")
+    logger.info(f"✅ Uploaded sidecar to s3://{bucket}/{key}")
     return key
 
 
@@ -120,11 +152,30 @@ def download_index_from_s3(video_key: str) -> Tuple[faiss.Index, List[int]]:
         raise
     blob = obj["Body"].read()
     logger.info(f"📦 Index bytes: {len(blob)}")
+    return deserialize_index(blob)
+
+
+def download_sidecar_from_s3(video_key: str) -> Tuple[List[int], np.ndarray]:
+    """
+    Returns (timestamps, maxp) or raises FileNotFoundError/PermissionError.
+    """
+    s3 = get_s3_client()
+    key = s3_key_for_sidecar(video_key)
+    bucket = settings.s3_bucket_videos
+    logger.info(f"⬇️  Downloading sidecar from s3://{bucket}/{key}")
     try:
-        index, timestamps = deserialize_index(blob)
-        logger.info(f"✅ Deserialized index: ntotal={index.ntotal}, ts_len={len(timestamps)}")
-        return index, timestamps
-    except Exception as e:
-        head = blob[:16]
-        logger.error(f"❌ Deserialization failed: {e} | first16={head!r} | len={len(blob)}")
+        obj = s3.get_object(Bucket=bucket, Key=key)
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code")
+        msg = e.response.get("Error", {}).get("Message")
+        logger.warning(f"S3 get_object failed for {bucket}/{key}: {code} — {msg}")
+        if code in ("NoSuchKey", "NotFound", "404"):
+            raise FileNotFoundError(f"No sidecar at s3://{bucket}/{key}") from e
+        if code in ("AccessDenied", "403"):
+            raise PermissionError(f"Access denied for s3://{bucket}/{key}") from e
         raise
+    blob = obj["Body"].read()
+    with np.load(io.BytesIO(blob)) as z:
+        ts = z["timestamps"].astype(int).tolist()
+        maxp = z["maxp"].astype("float32")
+    return ts, maxp
